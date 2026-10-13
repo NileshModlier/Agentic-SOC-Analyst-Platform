@@ -1,0 +1,176 @@
+# Runtime: PostgreSQL, Redis, schema migration, the outbox relay, the read API,
+# and the observability stack. Grafana is published on host port 3001 so it does
+# not take the console's port 3000. Local Grafana credentials are admin / admin.
+# Ingest from the host or a one-off container:
+#   docker compose run --rm -v ${PWD}:/work outbox-relay soc-ingest ingest --tenant <uuid> --kind sigma_alert --file /work/alert.json
+name: soc-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: soc
+      POSTGRES_PASSWORD: soc
+      POSTGRES_DB: soc
+    # Host 5434 keeps this stack from colliding with another local Postgres on 5432.
+    ports:
+      - "5434:5432"
+    volumes:
+      - soc_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soc -d soc"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      SOC_DATABASE_URL: postgresql+psycopg://soc:soc@postgres:5432/soc
+      SOC_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  outbox-relay:
+    build: .
+    environment:
+      SOC_DATABASE_URL: postgresql+psycopg://soc:soc@postgres:5432/soc
+      SOC_REDIS_URL: redis://redis:6379/0
+      SOC_OUTBOX_STREAM: soc.outbox
+      SOC_SERVICE_NAME: soc-relay
+      SOC_OTLP_ENDPOINT: http://tempo:4317
+      SOC_LOG_FORMAT: json
+      SOC_METRICS_PORT: "9101"
+    ports:
+      - "9101:9101"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["uvicorn", "soc_platform.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      SOC_DATABASE_URL: postgresql+psycopg://soc:soc@postgres:5432/soc
+      SOC_REDIS_URL: redis://redis:6379/0
+      SOC_API_CURSOR_SECRET: dev-only-change-me
+      SOC_SERVICE_NAME: soc-api
+      SOC_OTLP_ENDPOINT: http://tempo:4317
+      SOC_LOG_FORMAT: json
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "3200:3200"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./deploy/observability/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./deploy/observability/loki/loki.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./deploy/observability/promtail/promtail.yaml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      loki:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - api
+      - outbox-relay
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./deploy/observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+volumes:
+  soc_pgdata:
+  tempo_data:
+  loki_data:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,86 @@
+groups:
+  - name: soc
+    rules:
+      - alert: ApiDown
+        expr: up{job="soc-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: The security API is not being scraped.
+      - alert: RelayDown
+        expr: up{job="soc-relay"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: The outbox relay metrics endpoint is not being scraped.
+      - alert: DependencyDown
+        expr: dependency_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: PostgreSQL or Redis failed a readiness probe.
+      - alert: ApiErrorRateHigh
+        expr: |
+          sum(rate(api_errors_total[5m]))
+          /
+          clamp_min(sum(rate(api_request_total[5m])), 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than five percent of API responses are errors.
+      - alert: ApiLatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(api_request_duration_seconds_bucket[5m])) by (le)) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: API p95 latency is above two seconds.
+      - alert: OutboxPublishFailures
+        expr: sum(rate(outbox_publish_failures_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The outbox relay is failing to publish.
+      - alert: DeadLettersIncreasing
+        expr: increase(dead_letters_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Dead-letter rows are increasing.
+      - alert: AgentRunFailures
+        expr: sum(rate(agent_runs_total{status="failed"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Investigation runs are failing.
+      - alert: RedisErrors
+        expr: sum(rate(redis_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis commands are returning errors.
+      - alert: DbPoolSaturation
+        expr: |
+          (
+            sum(db_pool_connections{state="checked_out"})
+            /
+            clamp_min(
+              sum(db_pool_connections{state="checked_out"})
+              + sum(db_pool_connections{state="checked_in"}),
+              1
+            )
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The database pool is almost fully checked out.
